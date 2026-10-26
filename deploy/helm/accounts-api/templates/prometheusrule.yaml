@@ -1,0 +1,41 @@
+{{- if and .Values.metrics.prometheusRule.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule") }}
+{{- $sel := printf "namespace=\"%s\", job=\"%s\"" .Release.Namespace (include "accounts-api.fullname" .) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "accounts-api.fullname" . }}
+  labels:
+    {{- include "accounts-api.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: accounts-api.slo
+      rules:
+        - alert: AccountsApiHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{ {{- $sel }}, status_code=~"5.."}[5m]))
+              / clamp_min(sum(rate(http_requests_total{ {{- $sel }}}[5m])), 1e-9)
+              > {{ .Values.metrics.prometheusRule.errorRateThreshold }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: More than {{ mulf .Values.metrics.prometheusRule.errorRateThreshold 100 }}% of requests are failing with 5xx
+            description: '5xx ratio is {{ "{{" }} $value | humanizePercentage {{ "}}" }} over the last 5 minutes.'
+        - alert: AccountsApiHighLatency
+          expr: |
+            histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{ {{- $sel }}}[5m])))
+              > {{ .Values.metrics.prometheusRule.latencyP95ThresholdSeconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: p95 latency above {{ .Values.metrics.prometheusRule.latencyP95ThresholdSeconds }}s
+            description: 'p95 latency is {{ "{{" }} $value | humanizeDuration {{ "}}" }}.'
+        - alert: AccountsApiTargetDown
+          expr: absent(up{ {{- $sel }}} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: No accounts-api pod is being scraped successfully
+{{- end }}

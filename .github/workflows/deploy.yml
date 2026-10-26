@@ -1,0 +1,204 @@
+# Continuous delivery: every push to the default branch goes to production.
+#
+#   checks ─▶ infrastructure (terraform apply) ─▶ image (build, push to ECR, scan) ─▶ deploy (helm) ─▶ smoke test
+#
+# Jobs that touch AWS run in the "production" GitHub environment. Protect it with required reviewers
+# and a main-only deployment branch rule: that is the approval gate, and the IAM roles only trust it.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One production deployment at a time; never cancel one halfway through.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.0"
+  HELM_VERSION: "v3.19.0"
+  TF_VAR_FILE: ${{ vars.TF_VAR_FILE || 'env/demo.tfvars' }}
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    # A called workflow may not request more than its caller grants. ci.yml's plan job asks for
+    # id-token (it is skipped on push, but permissions are validated before jobs are evaluated).
+    permissions:
+      contents: read
+      id-token: write
+
+  infrastructure:
+    name: Infrastructure - terraform apply
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform/platform
+    outputs:
+      aws_region: ${{ steps.out.outputs.aws_region }}
+      cluster_name: ${{ steps.out.outputs.cluster_name }}
+      ecr_repository_url: ${{ steps.out.outputs.ecr_repository_url }}
+      app_namespace: ${{ steps.out.outputs.app_namespace }}
+      waf_web_acl_arn: ${{ steps.out.outputs.waf_web_acl_arn }}
+      alb_logs_bucket: ${{ steps.out.outputs.alb_logs_bucket }}
+      certificate_arn: ${{ steps.out.outputs.certificate_arn }}
+      api_hostname: ${{ steps.out.outputs.api_hostname }}
+      vpc_cidr: ${{ steps.out.outputs.vpc_cidr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-apply-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+          # ARNs below contain the account ID; masking it would make GitHub drop the job outputs.
+          mask-aws-account-id: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="region=${{ vars.AWS_REGION }}"
+      - name: Plan
+        run: terraform plan -input=false -no-color -var-file="$TF_VAR_FILE" -out=tfplan | tee plan.txt
+      - name: Apply
+        run: terraform apply -input=false -auto-approve tfplan
+      - name: Export outputs
+        id: out
+        run: |
+          terraform output -json | jq -r 'to_entries[] | "\(.key)=\(.value.value)"' \
+            | grep -E '^(aws_region|cluster_name|ecr_repository_url|app_namespace|waf_web_acl_arn|alb_logs_bucket|certificate_arn|api_hostname|vpc_cidr)=' \
+            >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Image - build, push to ECR, scan
+    needs: infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-image-${{ github.run_id }}
+          aws-region: ${{ needs.infrastructure.outputs.aws_region }}
+          mask-aws-account-id: false
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - name: Resolve image reference
+        id: ref
+        env:
+          REPO_URL: ${{ needs.infrastructure.outputs.ecr_repository_url }}
+        run: |
+          echo "image=${REPO_URL}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          # Tags are immutable, so a re-run for the same commit reuses the image instead of failing.
+          if aws ecr describe-images --repository-name "${REPO_URL#*/}" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.ref.outputs.exists == 'false'
+      - name: Build and push (with SBOM and provenance attestations)
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ref.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Trivy - scan the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  deploy:
+    name: Deploy - helm upgrade and smoke test
+    needs: [infrastructure, image]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.smoke.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NS: ${{ needs.infrastructure.outputs.app_namespace }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ needs.infrastructure.outputs.aws_region }}
+          mask-aws-account-id: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - run: aws eks update-kubeconfig --name "${{ needs.infrastructure.outputs.cluster_name }}" --region "${{ needs.infrastructure.outputs.aws_region }}"
+      - name: Helm upgrade (rolls back automatically if pods do not become ready)
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          helm upgrade --install accounts-api deploy/helm/accounts-api \
+            --namespace "$NS" \
+            --atomic --wait --timeout 10m --history-max 10 \
+            --set image.repository="${IMAGE%:*}" \
+            --set image.tag="${IMAGE##*:}" \
+            --set ingress.host="${{ needs.infrastructure.outputs.api_hostname }}" \
+            --set ingress.certificateArn="${{ needs.infrastructure.outputs.certificate_arn }}" \
+            --set ingress.wafAclArn="${{ needs.infrastructure.outputs.waf_web_acl_arn }}" \
+            --set ingress.accessLogsBucket="${{ needs.infrastructure.outputs.alb_logs_bucket }}" \
+            --set networkPolicy.ingressFromCidr="${{ needs.infrastructure.outputs.vpc_cidr }}" \
+            --set auth.externalSecret.region="${{ needs.infrastructure.outputs.aws_region }}"
+      - name: Smoke test through the public load balancer
+        id: smoke
+        run: |
+          host="${{ needs.infrastructure.outputs.api_hostname }}"
+          if [ -n "$host" ]; then url="https://$host"; else
+            for _ in $(seq 1 60); do
+              lb=$(kubectl -n "$NS" get ingress accounts-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+              [ -n "$lb" ] && break; sleep 10
+            done
+            url="http://$lb"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          # A brand-new ALB needs a few minutes before DNS resolves and targets are healthy.
+          for _ in $(seq 1 60); do curl -fsS "$url/health" && break; sleep 10; done
+          key=$(kubectl -n "$NS" get secret accounts-api-auth -o jsonpath='{.data.API_KEY}' | base64 -d)
+          echo "::add-mask::$key"
+          check() { got=$(curl -s -o /dev/null -w '%{http_code}' "$@"); echo "$* -> $got"; [ "$got" = "$expected" ]; }
+          expected=200 check "$url/health"
+          expected=401 check "$url/getAccount"
+          expected=200 check -H "x-api-key: $key" "$url/getAccount"
+          expected=404 check "$url/metrics"
+          echo "### Deployed ${GITHUB_SHA::7} to $url" >> "$GITHUB_STEP_SUMMARY"

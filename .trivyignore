@@ -1,0 +1,16 @@
+# Accepted IaC findings. Every entry is a deliberate trade-off, documented in SOLUTION.md (Gaps).
+# Review this file whenever the architecture changes; do not add entries without a reason.
+
+# EKS API endpoint is public (still IAM-authenticated, audit-logged) because GitHub-hosted runners have
+# no fixed egress IPs. Fix: self-hosted runners in the VPC, then endpoint_public_access = false, or
+# narrow cluster_endpoint_public_access_cidrs to the runners' NAT IPs.
+AVD-AWS-0040
+AVD-AWS-0041
+
+# Node security group allows all egress. Nodes must reach ECR, EKS, STS and package mirrors through NAT;
+# pod-level egress is restricted by Kubernetes NetworkPolicy instead (the app may only reach DNS).
+aws-vpc-no-public-egress-sgr
+
+# ALB access log delivery only supports SSE-S3 (AWS limitation), not customer-managed KMS keys.
+# Applies to infra/terraform/platform/security.tf aws_s3_bucket_server_side_encryption_configuration.alb_logs.
+AVD-AWS-0132

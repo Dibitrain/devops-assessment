@@ -1,0 +1,79 @@
+# Manual teardown. Order matters: the ALB is created by the in-cluster controller, not by Terraform,
+# so the app must be uninstalled (and the ALB deleted) before Terraform destroys the VPC.
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the cluster name ("accounts-api") to confirm'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.0"
+  HELM_VERSION: "v3.19.0"
+  TF_VAR_FILE: ${{ vars.TF_VAR_FILE || 'env/demo.tfvars' }}
+
+jobs:
+  uninstall-app:
+    if: inputs.confirm == 'accounts-api'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-destroy-app-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Uninstall and wait for the ALB to be released
+        run: |
+          if ! aws eks update-kubeconfig --name accounts-api --region "${{ vars.AWS_REGION }}"; then
+            echo "Cluster not found; nothing to uninstall."; exit 0
+          fi
+          helm uninstall accounts-api -n accounts-api --wait --timeout 5m || true
+          for _ in $(seq 1 30); do
+            kubectl -n accounts-api get ingress accounts-api >/dev/null 2>&1 || break
+            sleep 10
+          done
+          # Give the controller time to delete the ALB and its security groups.
+          sleep 60
+
+  destroy-infrastructure:
+    needs: uninstall-app
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform/platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-destroy-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="region=${{ vars.AWS_REGION }}"
+      - run: terraform destroy -input=false -auto-approve -var-file="$TF_VAR_FILE"

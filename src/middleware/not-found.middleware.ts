@@ -11,7 +11,8 @@ export class NotFoundMiddleware implements ExpressMiddlewareInterface {
       return;
     }
 
-    if (req.method !== "GET") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.set("Allow", "GET, HEAD");
       res.status(405).json({
         error: "Method not allowed. This API only supports GET requests.",
       });
@@ -22,9 +23,9 @@ export class NotFoundMiddleware implements ExpressMiddlewareInterface {
       error: "Not found",
       availableEndpoints: [
         "GET /health",
-        "GET /metrics",
+        "GET /ready",
         "GET /getAccount",
-        "GET /getAccount?id=<number>",
+        "GET /getAccount?id=<account id>",
       ],
     });
   }

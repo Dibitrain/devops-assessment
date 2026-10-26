@@ -1,0 +1,126 @@
+# Defaults are production-shaped. CI overrides image, ingress and auth settings from Terraform outputs;
+# see .github/workflows/deploy.yml. values-local.yaml turns off the AWS-only pieces for kind.
+
+image:
+  repository: accounts-api # CI: <account>.dkr.ecr.<region>.amazonaws.com/accounts-api
+  tag: "" # CI: the git commit SHA. Defaults to .Chart.AppVersion.
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Used only when autoscaling is disabled.
+replicaCount: 2
+
+ports:
+  http: 3000
+  metrics: 9100
+
+env:
+  LOG_LEVEL: info
+  # One proxy hop (the ALB) so req.ip in access logs is the real client IP.
+  TRUST_PROXY_HOPS: "1"
+  # After SIGTERM: fail readiness, keep serving this long, then drain (src/server.ts).
+  SHUTDOWN_DELAY_MS: "5000"
+  SHUTDOWN_TIMEOUT_MS: "20000"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    # No CPU limit: throttling hurts latency more than it protects neighbours; requests guarantee share.
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Termination sequence (all must fit in terminationGracePeriodSeconds):
+#   preStop sleep -> SIGTERM -> app drain delay -> close connections
+# The preStop sleep covers the time the ALB needs to stop routing to the pod.
+lifecycle:
+  preStopSleepSeconds: 15
+terminationGracePeriodSeconds: 45
+
+probes:
+  startup:
+    path: /health
+    periodSeconds: 2
+    failureThreshold: 30
+  liveness:
+    path: /health
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    path: /ready
+    periodSeconds: 5
+    failureThreshold: 2
+
+# Spread replicas across zones (survive an AZ outage) and nodes (survive a node loss).
+topologySpread:
+  enabled: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: alb
+  # Public hostname. Empty = the ALB's AWS-generated hostname, HTTP only (demo).
+  host: ""
+  # ACM certificate ARN. When set: HTTPS on 443 with TLS 1.2+ (TLS 1.3 preferred), HTTP redirected to HTTPS.
+  certificateArn: ""
+  sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  # AWS WAF web ACL ARN attached to the ALB.
+  wafAclArn: ""
+  # S3 bucket for ALB access logs.
+  accessLogsBucket: ""
+  # Only these paths are routed; everything else (including /metrics and /ready) gets the ALB's 404.
+  publicPaths:
+    - /health
+    - /getAccount
+  extraAnnotations: {}
+
+networkPolicy:
+  enabled: true
+  # CIDR allowed to reach the HTTP port: the VPC (ALB nodes live there, target type is ip).
+  ingressFromCidr: 10.40.0.0/16
+  # Namespace allowed to scrape the metrics port.
+  monitoringNamespace: monitoring
+
+auth:
+  # Require an x-api-key header on /getAccount.
+  enabled: true
+  # Use an existing Secret (key API_KEY) instead of External Secrets, e.g. for local testing.
+  existingSecret: ""
+  externalSecret:
+    enabled: true
+    region: eu-west-1
+    remoteKey: accounts-api/api-key
+    refreshInterval: 1h
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+  prometheusRule:
+    enabled: true
+    # SLO thresholds for alerts.
+    errorRateThreshold: 0.01 # 1% of requests returning 5xx
+    latencyP95ThresholdSeconds: 0.5

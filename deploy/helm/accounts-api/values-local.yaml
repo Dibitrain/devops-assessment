@@ -1,0 +1,20 @@
+# Local kind cluster: no ALB, no AWS Secrets Manager. Used by scripts/kind-up.sh.
+image:
+  repository: accounts-api
+  tag: local
+  pullPolicy: Never
+
+env:
+  TRUST_PROXY_HOPS: "0"
+
+ingress:
+  enabled: false
+
+networkPolicy:
+  ingressFromCidr: 0.0.0.0/0
+
+auth:
+  enabled: true
+  existingSecret: accounts-api-auth-local
+  externalSecret:
+    enabled: false

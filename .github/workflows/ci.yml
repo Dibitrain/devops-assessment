@@ -1,0 +1,167 @@
+# Continuous integration: every pull request, and reused as the first stage of deploy.yml.
+# Nothing here can change AWS: the only AWS access is the read-only plan role, on pull requests.
+name: ci
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  TERRAFORM_VERSION: "1.17.0"
+  HELM_VERSION: "v3.19.0"
+  KUBERNETES_VERSION: "1.35.0"
+
+jobs:
+  app:
+    name: App - typecheck, test, audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      # Builds, then runs unit/integration tests including the SIGTERM drain test (Linux only).
+      - run: npm test
+      # Fail on high/critical advisories in production dependencies.
+      - run: npm audit --omit=dev --audit-level=high
+
+  image:
+    name: Image - build and scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: accounts-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the container (read-only root, no capabilities)
+        run: |
+          docker run -d --name api -p 3000:3000 --read-only --cap-drop ALL --security-opt no-new-privileges accounts-api:ci
+          for _ in $(seq 1 30); do curl -fsS localhost:3000/ready && break; sleep 1; done
+          curl -fsS localhost:3000/health
+          start=$(date +%s); docker stop -t 30 api; took=$(( $(date +%s) - start ))
+          code=$(docker inspect api --format '{{.State.ExitCode}}')
+          echo "graceful stop took ${took}s, exit code ${code}"
+          test "$code" = "0"
+      - name: Trivy - image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: accounts-api:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  chart:
+    name: Helm chart - lint and schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Lint
+        run: |
+          helm lint deploy/helm/accounts-api --strict
+          helm lint deploy/helm/accounts-api --strict -f deploy/helm/accounts-api/values-local.yaml
+      - name: Render and validate against Kubernetes and CRD schemas
+        run: |
+          helm template accounts-api deploy/helm/accounts-api -n accounts-api \
+            --kube-version "$KUBERNETES_VERSION" \
+            --api-versions monitoring.coreos.com/v1/ServiceMonitor \
+            --api-versions monitoring.coreos.com/v1/PrometheusRule \
+            --set ingress.certificateArn=arn:aws:acm:eu-west-1:123456789012:certificate/example \
+            --set ingress.host=api.example.com > rendered.yaml
+          docker run --rm -v "$PWD":/w ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary \
+            -kubernetes-version "$KUBERNETES_VERSION" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /w/rendered.yaml
+
+  terraform:
+    name: Terraform - fmt, validate, misconfiguration scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - run: terraform fmt -check -recursive infra/terraform
+      - name: Validate
+        run: |
+          for stack in bootstrap platform; do
+            terraform -chdir=infra/terraform/$stack init -backend=false -input=false
+            terraform -chdir=infra/terraform/$stack validate
+          done
+      - name: Trivy - IaC misconfiguration (Terraform, Helm, Dockerfile)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+          exit-code: "1"
+
+  plan:
+    name: Terraform - plan (pull requests)
+    needs: terraform
+    # Same-repo pull requests only (forks get no OIDC token), and only once AWS is bootstrapped.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.AWS_PLAN_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform/platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gha-plan-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="region=${{ vars.AWS_REGION }}"
+      # -refresh=false: the plan role is read-only and has no Kubernetes or secret-value access, so the
+      # plan is computed against state. Drift is caught by the full plan in deploy.yml before apply.
+      - name: Plan
+        run: |
+          terraform plan -input=false -refresh=false -lock=false -no-color \
+            -var-file="${{ vars.TF_VAR_FILE || 'env/demo.tfvars' }}" | tee plan.txt
+          {
+            echo '### Terraform plan (platform)'
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

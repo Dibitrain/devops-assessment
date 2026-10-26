@@ -1,0 +1,16 @@
+# Local stand-in for EKS: three workers labelled as three zones so topology spread, PDBs and node drains
+# (the EKS upgrade drill) can be exercised for free.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: accounts-api
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-b
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-c

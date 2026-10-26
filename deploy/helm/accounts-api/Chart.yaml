@@ -1,0 +1,8 @@
+apiVersion: v2
+name: accounts-api
+description: Accounts API - Express/TypeScript service with health, readiness, account and Prometheus metrics endpoints
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+# 1.30+ for the native preStop `sleep` action (the distroless image has no shell or sleep binary).
+kubeVersion: ">=1.30.0-0"

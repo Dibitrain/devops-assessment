@@ -41,55 +41,96 @@ You have been provided with a simple web service that serves 4 endpoints, you ar
 3. A live URL is optional
 4. Share how you used AI for your solution (if you did)
 
+## Solution
+
+- **[SOLUTION.md](SOLUTION.md)**: architecture, how to deploy and tear down, decisions and trade-offs, security and compliance, backup and recovery, gaps, AI usage.
+- **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)**: step-by-step account of how each problem was found and solved, with evidence.
+- **[docs/eks-upgrade-runbook.md](docs/eks-upgrade-runbook.md)**: zero-downtime EKS upgrade plan.
+
 ## How to Run the Application
 
 ```bash
-npm install
-npm run build
-npm start        # serves on PORT (default 3000)
+npm ci
+npm test         # builds, then runs the test suite
+npm start        # API on PORT (default 3000), metrics on METRICS_PORT (default 9100)
 ```
 
-Development (watch mode):
+Development (recompiles with tsc and restarts on change):
 
 ```bash
 npm run dev
 ```
 
+Container and full local stack (kind + Prometheus + Grafana):
+
+```bash
+docker build -t accounts-api:local .
+scripts/kind-up.sh
+```
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `3000` | Public API port |
+| `METRICS_PORT` | `9100` | Internal Prometheus metrics port (never exposed publicly) |
+| `API_KEY` | empty | When set, `GET /getAccount` requires a matching `x-api-key` header |
+| `TRUST_PROXY_HOPS` | `0` | Reverse proxies in front of the app (`1` behind the ALB) |
+| `SHUTDOWN_DELAY_MS` | `5000` | After SIGTERM, keep serving (readiness failing) before draining |
+| `SHUTDOWN_TIMEOUT_MS` | `20000` | Force exit if draining takes longer |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (JSON lines on stdout/stderr) |
+
 ## Project structure
 
 ```text
 src/
-├── app.ts                 # App bootstrap: TypeDI container wiring + controller/middleware registration
-├── server.ts              # Entry point: starts the HTTP listener
-├── controllers/           # routing-controllers JSON controllers
-│   ├── account.controller.ts
-│   ├── health.controller.ts
-│   └── metrics.controller.ts
-├── services/              # Business logic, injected into controllers/middleware via TypeDI
+├── app.ts                 # Public app (controllers + middleware) and the separate metrics app
+├── server.ts              # Entry point: starts both listeners, graceful shutdown on SIGTERM
+├── config.ts              # Environment configuration
+├── logger.ts              # JSON-lines logger
+├── controllers/
+│   ├── account.controller.ts          # GET /getAccount (API key protected)
+│   └── health.controller.ts           # GET /health (liveness), GET /ready (readiness)
+├── services/
 │   ├── account.service.ts
-│   └── metrics.service.ts
-├── middleware/            # routing-controllers Express middlewares
-│   ├── error-handler.middleware.ts    # Maps thrown HttpErrors to { error: ... } responses
+│   ├── lifecycle.service.ts           # Draining state for readiness
+│   └── metrics.service.ts             # Counter, latency histogram, in-flight gauge
+├── middleware/
+│   ├── api-key.middleware.ts          # Constant-time x-api-key check
+│   ├── error-handler.middleware.ts    # 4xx messages pass through, 5xx are generic (details logged)
 │   ├── not-found.middleware.ts        # 404 fallback / 405 for non-GET methods
-│   └── request-metrics.middleware.ts  # Counts every request into http_requests_total
+│   ├── request-metrics.middleware.ts  # Metrics by route template + access log
+│   └── security-headers.middleware.ts
 └── interfaces/
     └── account.ts
+test/                      # node:test integration tests against the compiled app
+Dockerfile                 # Multi-stage, distroless non-root runtime
+infra/terraform/           # bootstrap (state, OIDC, CI roles, CloudTrail) and platform (VPC, EKS, ECR, WAF, add-ons)
+deploy/helm/accounts-api/  # Helm chart
+deploy/kind/               # Local three-zone cluster definition
+observability/             # kube-prometheus-stack values, Grafana dashboard JSON
+.github/workflows/         # ci.yml, deploy.yml, destroy.yml
 ```
 
 ## Endpoints
 
-| Endpoint               | Description                                              |
-| --------------------- | -------------------------------------------------------- |
-| `GET /health`         | Liveness check with uptime                               |
-| `GET /metrics`        | Prometheus metrics via prom-client                       |
-| `GET /getAccount`     | All accounts from the dummy array                        |
-| `GET /getAccount?id=1` | Single account by id (404 if not found)                |
+| Endpoint | Port | Description |
+| --- | --- | --- |
+| `GET /health` | 3000 | Liveness check with uptime |
+| `GET /ready` | 3000 | Readiness; returns `503` while the pod is draining |
+| `GET /getAccount` | 3000 | All accounts (requires `x-api-key` when `API_KEY` is set) |
+| `GET /getAccount?id=66ab443c4d4ac0b1cdf45691` | 3000 | Single account by id (404 if not found) |
+| `GET /metrics` | 9100 | Prometheus metrics (internal only) |
 
 Non-GET methods are rejected with `405`, unknown routes with `404`.
 
 ## Metrics
 
-Exposed in Prometheus text format at `GET /metrics`:
+Exposed in Prometheus text format at `GET :9100/metrics`:
 
-- Default Node.js process metrics (CPU, memory, event loop, GC, ...)
-- `http_requests_total{method,route,status_code}` — custom request counter
+- Default Node.js process metrics (CPU, memory, event loop lag, GC, ...)
+- `http_requests_total{method,route,status_code}`: request counter
+- `http_request_duration_seconds{method,route,status_code}`: latency histogram
+- `http_requests_in_flight`: concurrent requests
+
+`route` is the matched route template (`/getAccount`), or `unmatched` for unknown paths, so label cardinality is bounded.

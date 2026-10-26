@@ -1,0 +1,59 @@
+{{- if .Values.ingress.enabled }}
+{{- $tls := ne .Values.ingress.certificateArn "" }}
+{{- $lbAttrs := list "routing.http.drop_invalid_header_fields.enabled=true" "idle_timeout.timeout_seconds=60" }}
+{{- if .Values.ingress.accessLogsBucket }}
+{{- $lbAttrs = concat $lbAttrs (list "access_logs.s3.enabled=true" (printf "access_logs.s3.bucket=%s" .Values.ingress.accessLogsBucket) "access_logs.s3.prefix=alb") }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "accounts-api.fullname" . }}
+  labels:
+    {{- include "accounts-api.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # Route straight to pod IPs (no NodePort hop); required for readiness gates.
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.probes.readiness.path }}
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # Default deregistration delay is 300s; the app drains well within 30s.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    alb.ingress.kubernetes.io/load-balancer-attributes: {{ join "," $lbAttrs }}
+    {{- if $tls }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn }}
+    alb.ingress.kubernetes.io/ssl-policy: {{ .Values.ingress.sslPolicy }}
+    {{- else }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    {{- end }}
+    {{- with .Values.ingress.wafAclArn }}
+    alb.ingress.kubernetes.io/wafv2-acl-arn: {{ . }}
+    {{- end }}
+    {{- with .Values.ingress.host }}
+    external-dns.alpha.kubernetes.io/hostname: {{ . }}
+    {{- end }}
+    {{- with .Values.ingress.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - {{- with .Values.ingress.host }}
+      host: {{ . }}
+      {{- end }}
+      http:
+        paths:
+          {{- range .Values.ingress.publicPaths }}
+          - path: {{ . }}
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "accounts-api.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+{{- end }}

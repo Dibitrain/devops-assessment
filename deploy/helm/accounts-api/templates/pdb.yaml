@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Node drains (EKS upgrades, AMI rollouts, scale-in) may never take the last ready replica.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "accounts-api.fullname" . }}
+  labels:
+    {{- include "accounts-api.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "accounts-api.selectorLabels" . | nindent 6 }}
+{{- end }}

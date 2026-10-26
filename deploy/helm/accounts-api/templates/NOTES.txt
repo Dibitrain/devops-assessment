@@ -1,0 +1,16 @@
+{{ include "accounts-api.fullname" . }} {{ include "accounts-api.imageTag" . }} is deployed to namespace {{ .Release.Namespace }}.
+
+{{- if .Values.ingress.enabled }}
+
+Public URL (the ALB takes 2-3 minutes to provision on first install):
+  kubectl -n {{ .Release.Namespace }} get ingress {{ include "accounts-api.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+{{- else }}
+
+Port-forward to test:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "accounts-api.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/health
+{{- end }}
+{{- if .Values.auth.enabled }}
+
+/getAccount requires the x-api-key header (Secret {{ include "accounts-api.authSecretName" . }}, key API_KEY).
+{{- end }}

@@ -1,0 +1,9 @@
+# Files that run inside Linux (shell, containers, CI) must keep LF endings even on Windows checkouts.
+*.sh       text eol=lf
+Dockerfile text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.tf       text eol=lf
+*.tfvars   text eol=lf
+*.hcl      text eol=lf
+*.tpl      text eol=lf

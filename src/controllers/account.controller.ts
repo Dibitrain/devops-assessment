@@ -1,10 +1,12 @@
-import { Get, JsonController, NotFoundError, QueryParam } from "routing-controllers";
+import { Get, JsonController, NotFoundError, QueryParam, UseBefore } from "routing-controllers";
 import { Service } from "typedi";
-import type { Account } from "../interfaces/account.ts";
+import type { Account } from "../interfaces/account.js";
+import { ApiKeyMiddleware } from "../middleware/api-key.middleware.js";
 import { AccountService } from "../services/account.service.js";
 
 @Service()
 @JsonController("/getAccount")
+@UseBefore(ApiKeyMiddleware)
 export class AccountController {
   constructor(private readonly accountService: AccountService) {}
 

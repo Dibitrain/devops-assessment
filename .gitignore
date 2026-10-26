@@ -3,3 +3,12 @@ node_modules/
 *.log
 .DS_Store
 dist
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+
+# Rendered manifests from local checks
+rendered*.yaml
