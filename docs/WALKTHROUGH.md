@@ -543,6 +543,7 @@ real apply, and what to check:
 | 17 | Container logs not shipped | Self-review of SOLUTION.md claims | CloudWatch Observability add-on | `eks.tf`, `addons.tf` |
 | 18 | Error-rate and availability stats show "No data" when there are no errors | Running every dashboard query against live Prometheus | `or vector(0)` on error numerators | `observability/dashboards/accounts-api.json` |
 | 19 | `deploy.yml` would be rejected at load time: called `ci.yml` requests `id-token: write` the caller did not grant | Manual review (actionlint does not catch it) | Grant it on the `checks` job | `.github/workflows/deploy.yml` |
+| 20 | First CI run failed: the IaC scan also scanned modules downloaded by `terraform init` (their example manifests) | GitHub Actions run on push | `skip-dirs` for `.terraform/`; AWS jobs skip with a notice until the bootstrap variables exist | `.github/workflows/ci.yml`, `deploy.yml` |
 
 ## Reproduce everything
 

@@ -120,6 +120,9 @@ jobs:
         with:
           scan-type: config
           scan-ref: .
+          # `terraform init` above downloads the community modules (with their example manifests) into
+          # .terraform/. Scan our code; the modules themselves are still evaluated through our module calls.
+          skip-dirs: infra/terraform/bootstrap/.terraform,infra/terraform/platform/.terraform
           severity: HIGH,CRITICAL
           trivyignores: .trivyignore
           exit-code: "1"

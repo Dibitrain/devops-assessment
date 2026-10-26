@@ -33,9 +33,24 @@ jobs:
       contents: read
       id-token: write
 
+  # Until the bootstrap stack has been applied and its outputs saved as repository variables
+  # (SOLUTION.md, "On AWS, from scratch"), there is nothing to deploy to: report that instead of failing.
+  aws-not-configured:
+    name: Deployment skipped - AWS not configured
+    needs: checks
+    if: vars.AWS_APPLY_ROLE_ARN == ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          msg="Repository variable AWS_APPLY_ROLE_ARN is not set, so infrastructure, image push and deploy were skipped. Run infra/terraform/bootstrap and set the variables it outputs to enable deployment."
+          echo "::notice title=Deployment skipped::$msg"
+          echo "### Deployment skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
   infrastructure:
     name: Infrastructure - terraform apply
     needs: checks
+    if: vars.AWS_APPLY_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: production
     permissions:
